@@ -61,6 +61,35 @@ Authentication uses a **Personal Access Token (PAT)** with `Code > Read` scope, 
 
 ---
 
+## Scope — MD Files Only
+
+This pipeline syncs **only `.md` files**. The following wiki artifacts are explicitly excluded:
+
+| Artifact | Excluded? | Reason |
+|----------|-----------|--------|
+| `*.md` files | No — these are synced | Documentation content for the search index |
+| `.order` files | Yes | Wiki sidebar ordering only; not searchable content |
+| `.attachments/` folder | Yes | Images/binaries; not indexable as text by Azure AI Search |
+| `README.md` | Yes | Git convention file; not a wiki page |
+
+---
+
+## How Create / Update / Delete Are Handled
+
+Every wiki edit is a Git commit. The pipeline detects the type of change and maps it to the correct blob storage operation:
+
+| Wiki Action | Git Effect | Pipeline Detection | Blob Storage Operation | Search Index Effect |
+|-------------|-----------|-------------------|----------------------|-------------------|
+| **Create** a new page | New `.md` file added | File in diff + exists on disk | `az storage blob upload` (new blob) | Indexer adds new document on next run |
+| **Update** an existing page | `.md` file modified | File in diff + exists on disk | `az storage blob upload --overwrite` | Indexer re-processes document (change feed detects modified blob) |
+| **Delete** a page | `.md` file removed | File in diff + **not** on disk | `az storage blob delete` | Indexer removes document (soft-delete detection policy) |
+| **Rename** a page | Old file deleted + new file added | Two entries in diff (one exists, one doesn't) | Delete old blob + upload new blob | Old doc removed, new doc added |
+| **Move** page to subfolder | Path changes in git | Same as rename — old path deleted, new path added | Delete old blob + upload new blob | Category field updates (derived from folder path) |
+
+**Full sync** handles all of these by comparing the wiki snapshot to what's in blob storage and reconciling (upload missing, delete orphaned). **Incremental sync** handles them by inspecting `git diff` between the last two commits.
+
+---
+
 ## Sync Architecture
 
 ```
@@ -71,17 +100,25 @@ Authentication uses a **Personal Access Token (PAT)** with `Code > Read` scope, 
 │                      │                  │                      │
 └──────────────────────┘                  └───────────┬──────────┘
                                                       │
-                                                      │ az storage blob
-                                                      │ upload-batch / azcopy
+                                              ┌───────┴───────┐
+                                              │               │
+                                          Upload new/     Delete orphaned
+                                          modified .md    blobs from
+                                          files           storage
+                                              │               │
+                                              └───────┬───────┘
                                                       │
                                           ┌───────────▼──────────┐
                                           │                      │
                                           │  Blob Storage        │
                                           │  (markdown-docs)     │
+                                          │  .md files only      │
                                           │                      │
                                           └───────────┬──────────┘
                                                       │
-                                                      │ Indexer triggers
+                                                      │ Indexer detects
+                                                      │ changes via
+                                                      │ change feed
                                                       ▼
                                           ┌──────────────────────┐
                                           │  Azure AI Search     │
@@ -91,12 +128,12 @@ Authentication uses a **Personal Access Token (PAT)** with `Code > Read` scope, 
 
 ### Two Sync Strategies
 
-| Strategy | Trigger | Pros | Cons |
-|----------|---------|------|------|
-| **Full sync** | Scheduled (e.g., nightly) or manual | Simple; guarantees consistency | Slower; re-uploads unchanged files |
-| **Incremental sync** | Wiki push trigger via pipeline | Fast; only uploads changed files | Slightly more complex pipeline logic |
+| Strategy | Trigger | Creates | Updates | Deletes | Pros | Cons |
+|----------|---------|---------|---------|---------|------|------|
+| **Full sync** | Scheduled (weekly) or manual | Yes | Yes | Yes (orphan cleanup) | Guarantees consistency; catches any missed incremental runs | Slower; re-uploads unchanged files |
+| **Incremental sync** | Wiki push trigger | Yes | Yes | Yes (via git diff) | Fast; only touches changed files | Requires `fetchDepth: 2`; may miss multi-commit pushes |
 
-**Recommendation:** Use incremental sync with a weekly full sync as a safety net.
+**Recommendation:** Use incremental sync for every wiki push, with a weekly full sync as a safety net to catch any drift.
 
 ---
 
@@ -143,7 +180,7 @@ The same storage account and container from the main integration plan is used:
 
 ## Azure DevOps Pipeline — Full Sync
 
-This pipeline clones the wiki repo, filters to only `.md` files, and uploads them to blob storage.
+This pipeline clones the wiki repo, filters to only `.md` files, uploads them to blob storage, and **deletes orphaned blobs** that no longer have a matching wiki page. This guarantees blob storage is an exact mirror of the wiki's `.md` files.
 
 ### `azure-pipelines-wiki-sync.yml`
 
@@ -193,6 +230,7 @@ stages:
               echo "=== Preparing MD files for upload ==="
               WIKI_DIR="$(Build.SourcesDirectory)"
               STAGING_DIR="$(Build.ArtifactStagingDirectory)/wiki-md"
+              MANIFEST="$(Build.ArtifactStagingDirectory)/wiki-manifest.txt"
               mkdir -p "$STAGING_DIR"
 
               # Copy .md files preserving folder structure
@@ -201,18 +239,22 @@ stages:
                 -not -path "./.attachments/*" \
                 -not -name "README.md" \
                 | while read -r file; do
-                    dest_dir="$STAGING_DIR/$(dirname "$file")"
+                    # Strip leading ./
+                    clean_path="${file#./}"
+                    dest_dir="$STAGING_DIR/$(dirname "$clean_path")"
                     mkdir -p "$dest_dir"
                     cp "$file" "$dest_dir/"
+                    # Record in manifest for orphan detection
+                    echo "$clean_path" >> "$MANIFEST"
                   done
 
               # Show what will be uploaded
               echo "=== Files staged for upload ==="
-              find "$STAGING_DIR" -name "*.md" | sort
-              echo "Total: $(find "$STAGING_DIR" -name "*.md" | wc -l) files"
+              sort "$MANIFEST"
+              echo "Total: $(wc -l < "$MANIFEST") files"
             displayName: "Filter and stage MD files"
 
-          # 3. Upload to blob storage
+          # 3. Upload to blob storage (handles creates + updates)
           - task: AzureCLI@2
             displayName: "Upload MD files to Blob Storage"
             inputs:
@@ -222,7 +264,7 @@ stages:
               inlineScript: |
                 STAGING_DIR="$(Build.ArtifactStagingDirectory)/wiki-md"
 
-                echo "=== Syncing to blob storage ==="
+                echo "=== Uploading new and updated MD files ==="
                 az storage blob upload-batch \
                   --account-name "$(storageAccountName)" \
                   --destination "$(containerName)" \
@@ -232,7 +274,54 @@ stages:
                   --auth-mode login \
                   --pattern "*.md"
 
-                echo "=== Upload complete ==="
+          # 4. Delete orphaned blobs (handles deletes)
+          #    Compare blobs in storage against the wiki manifest.
+          #    Any blob that exists in storage but NOT in the wiki is orphaned.
+          - task: AzureCLI@2
+            displayName: "Delete orphaned blobs (wiki pages that were removed)"
+            inputs:
+              azureSubscription: $(azureSubscription)
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                MANIFEST="$(Build.ArtifactStagingDirectory)/wiki-manifest.txt"
+
+                echo "=== Checking for orphaned blobs ==="
+
+                # List all .md blobs currently in the container
+                az storage blob list \
+                  --account-name "$(storageAccountName)" \
+                  --container-name "$(containerName)" \
+                  --auth-mode login \
+                  --query "[?ends_with(name, '.md')].name" \
+                  --output tsv > /tmp/blob-list.txt
+
+                DELETED_COUNT=0
+
+                # Compare: delete any blob not present in the wiki manifest
+                while read -r blob_name; do
+                  if ! grep -qxF "$blob_name" "$MANIFEST"; then
+                    echo "  [DELETE] $blob_name (no longer in wiki)"
+                    az storage blob delete \
+                      --account-name "$(storageAccountName)" \
+                      --container-name "$(containerName)" \
+                      --name "$blob_name" \
+                      --auth-mode login
+                    DELETED_COUNT=$((DELETED_COUNT + 1))
+                  fi
+                done < /tmp/blob-list.txt
+
+                echo "=== Orphan cleanup complete: $DELETED_COUNT blob(s) deleted ==="
+
+          # 5. Summary
+          - task: AzureCLI@2
+            displayName: "Print final blob inventory"
+            inputs:
+              azureSubscription: $(azureSubscription)
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                echo "=== Current blob storage contents ==="
                 az storage blob list \
                   --account-name "$(storageAccountName)" \
                   --container-name "$(containerName)" \
@@ -245,7 +334,16 @@ stages:
 
 ## Azure DevOps Pipeline — Incremental Sync
 
-This pipeline triggers on every wiki push and only uploads the files that changed.
+This pipeline triggers on every wiki push and only processes the `.md` files that changed. It uses `git diff --diff-filter` to reliably separate creates, updates, renames, and deletes.
+
+### How `git diff --diff-filter` Maps to Operations
+
+| Git Status | Filter Flag | Wiki Action | Pipeline Action |
+|-----------|-------------|-------------|-----------------|
+| `A` (Added) | `--diff-filter=A` | New page created | Upload new blob |
+| `M` (Modified) | `--diff-filter=M` | Page content edited | Upload blob with `--overwrite` |
+| `R` (Renamed) | `--diff-filter=R` | Page renamed or moved to another folder | Delete old blob path + upload new blob path |
+| `D` (Deleted) | `--diff-filter=D` | Page deleted | Delete blob |
 
 ### `azure-pipelines-wiki-sync-incremental.yml`
 
@@ -285,59 +383,77 @@ stages:
             clean: true
             fetchDepth: 2   # Need 2 commits to diff
 
+          # 1. Detect added, modified, renamed, and deleted .md files
           - script: |
-              echo "=== Detecting changed files ==="
+              echo "=== Detecting changed .md files ==="
               WIKI_DIR="$(Build.SourcesDirectory)"
               STAGING_DIR="$(Build.ArtifactStagingDirectory)/wiki-md"
-              DELETED_FILE="$(Build.ArtifactStagingDirectory)/deleted-files.txt"
+              DELETED_FILE="$(Build.ArtifactStagingDirectory)/deleted-blobs.txt"
               mkdir -p "$STAGING_DIR"
+              touch "$DELETED_FILE"
 
               cd "$WIKI_DIR"
 
-              # Get list of changed files between last 2 commits
-              CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "")
-
-              if [ -z "$CHANGED_FILES" ]; then
-                echo "No changes detected, performing full sync"
+              # Check if we have a previous commit to diff against
+              if ! git rev-parse HEAD~1 >/dev/null 2>&1; then
+                echo "First commit — falling back to full sync"
                 find . -name "*.md" \
                   -not -path "./.attachments/*" \
                   -not -name "README.md" \
                   | while read -r file; do
+                      clean_path="${file#./}"
+                      dest_dir="$STAGING_DIR/$(dirname "$clean_path")"
+                      mkdir -p "$dest_dir"
+                      cp "$file" "$dest_dir/"
+                      echo "  [UPLOAD] $clean_path"
+                    done
+              else
+                # --- ADDED + MODIFIED: stage for upload ---
+                git diff --name-only --diff-filter=AM HEAD~1 HEAD \
+                  -- '*.md' ':!.attachments/' ':!README.md' \
+                  | while read -r file; do
+                      echo "  [UPLOAD] $file"
                       dest_dir="$STAGING_DIR/$(dirname "$file")"
                       mkdir -p "$dest_dir"
                       cp "$file" "$dest_dir/"
                     done
-              else
-                echo "Changed files:"
-                echo "$CHANGED_FILES"
 
-                # Separate added/modified from deleted
-                echo "$CHANGED_FILES" | while read -r file; do
-                  if [[ "$file" == *.md ]] && \
-                     [[ "$file" != .attachments/* ]] && \
-                     [[ "$file" != README.md ]]; then
-                    if [ -f "$file" ]; then
-                      # File exists — added or modified
-                      dest_dir="$STAGING_DIR/$(dirname "$file")"
+                # --- RENAMED: upload new path, delete old path ---
+                # git diff -M shows renames as: old_path -> new_path
+                git diff --name-status --diff-filter=R -M HEAD~1 HEAD \
+                  -- '*.md' ':!.attachments/' ':!README.md' \
+                  | while read -r status old_path new_path; do
+                      echo "  [RENAME] $old_path -> $new_path"
+                      # Stage new file for upload
+                      dest_dir="$STAGING_DIR/$(dirname "$new_path")"
                       mkdir -p "$dest_dir"
-                      cp "$file" "$dest_dir/"
-                      echo "  [UPLOAD] $file"
-                    else
-                      # File no longer exists — deleted
-                      echo "$file" >> "$DELETED_FILE"
+                      cp "$new_path" "$dest_dir/"
+                      # Mark old path for deletion
+                      echo "$old_path" >> "$DELETED_FILE"
+                    done
+
+                # --- DELETED: mark for blob deletion ---
+                git diff --name-only --diff-filter=D HEAD~1 HEAD \
+                  -- '*.md' ':!.attachments/' ':!README.md' \
+                  | while read -r file; do
                       echo "  [DELETE] $file"
-                    fi
-                  fi
-                done
+                      echo "$file" >> "$DELETED_FILE"
+                    done
               fi
 
-              echo "##vso[task.setvariable variable=hasDeleted]$([ -f "$DELETED_FILE" ] && echo true || echo false)"
-              echo "##vso[task.setvariable variable=hasUploads]$([ "$(find "$STAGING_DIR" -name "*.md" | wc -l)" -gt 0 ] && echo true || echo false)"
+              UPLOAD_COUNT=$(find "$STAGING_DIR" -name "*.md" 2>/dev/null | wc -l)
+              DELETE_COUNT=$(wc -l < "$DELETED_FILE" 2>/dev/null || echo 0)
+              echo ""
+              echo "=== Summary: $UPLOAD_COUNT to upload, $DELETE_COUNT to delete ==="
+
+              # Set pipeline variables for conditional steps
+              echo "##vso[task.setvariable variable=hasUploads]$([ "$UPLOAD_COUNT" -gt 0 ] && echo true || echo false)"
+              echo "##vso[task.setvariable variable=hasDeletes]$([ "$DELETE_COUNT" -gt 0 ] && echo true || echo false)"
             displayName: "Detect changed MD files"
 
-          # Upload changed/new files
+          # 2. Upload new and modified .md files (creates + updates)
           - task: AzureCLI@2
-            displayName: "Upload changed MD files"
+            displayName: "Upload new/modified MD files"
             condition: eq(variables['hasUploads'], 'true')
             inputs:
               azureSubscription: $(azureSubscription)
@@ -345,6 +461,7 @@ stages:
               scriptLocation: "inlineScript"
               inlineScript: |
                 STAGING_DIR="$(Build.ArtifactStagingDirectory)/wiki-md"
+                echo "=== Uploading changed MD files ==="
                 az storage blob upload-batch \
                   --account-name "$(storageAccountName)" \
                   --destination "$(containerName)" \
@@ -354,138 +471,53 @@ stages:
                   --auth-mode login \
                   --pattern "*.md"
 
-          # Delete removed files from blob
+          # 3. Delete blobs for removed/renamed wiki pages (deletes)
           - task: AzureCLI@2
-            displayName: "Delete removed files from blob"
-            condition: eq(variables['hasDeleted'], 'true')
+            displayName: "Delete removed MD files from blob"
+            condition: eq(variables['hasDeletes'], 'true')
             inputs:
               azureSubscription: $(azureSubscription)
               scriptType: "bash"
               scriptLocation: "inlineScript"
               inlineScript: |
-                DELETED_FILE="$(Build.ArtifactStagingDirectory)/deleted-files.txt"
-                if [ -f "$DELETED_FILE" ]; then
-                  while read -r blob_name; do
-                    # Strip leading ./ if present
-                    blob_name="${blob_name#./}"
-                    echo "Deleting blob: $blob_name"
-                    az storage blob delete \
-                      --account-name "$(storageAccountName)" \
-                      --container-name "$(containerName)" \
-                      --name "$blob_name" \
-                      --auth-mode login \
-                      || echo "  Warning: could not delete $blob_name (may not exist)"
-                  done < "$DELETED_FILE"
-                fi
-```
-
----
-
-## Handling Wiki-Specific Artifacts
-
-### `.order` Files — Exclude from Blob Storage
-
-`.order` files control page ordering in the wiki sidebar. They are not documentation content and should **not** be uploaded to blob storage.
-
-The pipelines above already exclude them (they only copy `*.md` files).
-
-### `.attachments/` Folder — Optional Sync
-
-Wiki images and file attachments live in `.attachments/`. If your search index or MCP tools need to serve images:
-
-```yaml
-# Add this step after the MD upload step
-- task: AzureCLI@2
-  displayName: "Upload wiki attachments (optional)"
-  inputs:
-    azureSubscription: $(azureSubscription)
-    scriptType: "bash"
-    scriptLocation: "inlineScript"
-    inlineScript: |
-      WIKI_DIR="$(Build.SourcesDirectory)"
-      if [ -d "$WIKI_DIR/.attachments" ]; then
-        az storage blob upload-batch \
-          --account-name "$(storageAccountName)" \
-          --destination "$(containerName)" \
-          --destination-path ".attachments" \
-          --source "$WIKI_DIR/.attachments" \
-          --overwrite true \
-          --auth-mode login
-      fi
-```
-
-### Filename Normalization
-
-Wiki filenames use hyphens for spaces (`Getting-Started.md`). If you want the search index `title` field to display "Getting Started" instead of "Getting-Started", handle this in the indexer skillset.
-
-The **Custom WebApiSkill** from the main plan already extracts the title from the first `# heading` in the markdown content, which is the best approach. As a fallback, add a normalization step in the pipeline:
-
-```bash
-# Optional: create a metadata sidecar file for each MD file
-for file in $(find "$STAGING_DIR" -name "*.md"); do
-  filename=$(basename "$file" .md)
-  # Convert hyphens to spaces for a display-friendly title
-  display_title=$(echo "$filename" | sed 's/-/ /g')
-  # Write metadata sidecar (Azure Search can read these)
-  echo "{\"title\": \"$display_title\"}" > "${file%.md}.metadata.json"
-done
-```
-
----
-
-## Terraform — Pipeline Triggers via Webhook (Alternative)
-
-If you prefer to trigger the sync from outside Azure DevOps (e.g., from a Logic App or Azure Function), you can set up a service hook:
-
-```hcl
-# Azure Function to receive webhook and trigger pipeline
-resource "azurerm_linux_function_app" "wiki_trigger" {
-  name                = "func-wiki-trigger-${local.resource_prefix}"
-  resource_group_name = azurerm_resource_group.main.name
-  location            = azurerm_resource_group.main.location
-  service_plan_id     = azurerm_service_plan.logic_app.id
-
-  storage_account_name       = azurerm_storage_account.docs.name
-  storage_account_access_key = azurerm_storage_account.docs.primary_access_key
-
-  site_config {
-    application_stack {
-      python_version = "3.11"
-    }
-  }
-
-  app_settings = {
-    "DEVOPS_ORG_URL"        = "https://dev.azure.com/<org>"
-    "DEVOPS_PROJECT"        = "<project>"
-    "DEVOPS_PIPELINE_ID"    = "<pipeline-id>"
-    "DEVOPS_PAT"            = "@Microsoft.KeyVault(VaultName=kv-${local.resource_prefix};SecretName=devops-pat)"
-  }
-
-  tags = local.common_tags
-}
+                DELETED_FILE="$(Build.ArtifactStagingDirectory)/deleted-blobs.txt"
+                echo "=== Deleting removed blobs ==="
+                while read -r blob_name; do
+                  [ -z "$blob_name" ] && continue
+                  echo "  Deleting: $blob_name"
+                  az storage blob delete \
+                    --account-name "$(storageAccountName)" \
+                    --container-name "$(containerName)" \
+                    --name "$blob_name" \
+                    --auth-mode login \
+                    --delete-snapshots include \
+                    || echo "  Warning: $blob_name may not exist in blob storage"
+                done < "$DELETED_FILE"
 ```
 
 ---
 
 ## Alternative: AzCopy for Large Wiki Repos
 
-For wikis with thousands of pages or large attachments, `az storage blob upload-batch` can be slow. Use **AzCopy** for better performance:
+For wikis with hundreds of `.md` pages, `az storage blob upload-batch` can be slow. **AzCopy** is faster and natively handles creates, updates, **and deletes** in a single command via `--delete-destination=true`.
 
 ```yaml
+# Can replace both the upload-batch and orphan-delete steps in either pipeline
 - script: |
-    # Install AzCopy (already on hosted agents, but ensuring latest)
-    wget -q https://aka.ms/downloadazcopy-v10-linux -O azcopy.tar.gz
-    tar xzf azcopy.tar.gz --strip-components=1
-    chmod +x azcopy
+    STAGING_DIR="$(Build.ArtifactStagingDirectory)/wiki-md"
 
-    # Sync using AzCopy (only uploads changed files, deletes removed ones)
-    ./azcopy sync \
-      "$(Build.ArtifactStagingDirectory)/wiki-md" \
+    # azcopy sync handles all three operations:
+    #   - Creates:  uploads .md files not yet in blob storage
+    #   - Updates:  re-uploads .md files where MD5 hash changed
+    #   - Deletes:  removes blobs that have no matching local .md file
+    azcopy sync \
+      "$STAGING_DIR" \
       "https://$(storageAccountName).blob.core.windows.net/$(containerName)" \
       --delete-destination=true \
       --include-pattern="*.md" \
+      --put-md5 \
       --log-level=WARNING
-  displayName: "AzCopy sync to blob storage"
+  displayName: "AzCopy sync MD files to blob storage (create + update + delete)"
   env:
     AZCOPY_AUTO_LOGIN_TYPE: "SPN"
     AZCOPY_SPA_CLIENT_SECRET: $(servicePrincipalKey)
@@ -493,14 +525,16 @@ For wikis with thousands of pages or large attachments, `az storage blob upload-
     AZCOPY_TENANT_ID: $(tenantId)
 ```
 
-**AzCopy `sync` vs `upload-batch`:**
+**AzCopy `sync` vs `upload-batch` + manual delete:**
 
-| Feature | `az storage blob upload-batch` | `azcopy sync` |
-|---------|-------------------------------|----------------|
-| Differential upload | No (re-uploads everything) | Yes (compares MD5 hashes) |
-| Delete removed blobs | Manual | `--delete-destination=true` |
+| Feature | `az storage blob upload-batch` + manual delete | `azcopy sync --delete-destination` |
+|---------|------------------------------------------------|-------------------------------------|
+| Creates (new .md) | Yes | Yes |
+| Updates (modified .md) | Yes (`--overwrite`) | Yes (MD5 hash comparison) |
+| Deletes (removed .md) | Manual (must list blobs + compare) | Automatic (`--delete-destination=true`) |
+| Differential upload | No (re-uploads everything) | Yes (skips unchanged files) |
 | Parallelism | Limited | High (auto-tuned) |
-| Speed (1000+ files) | Slow | Fast |
+| Speed (500+ .md files) | Slow | Fast |
 | Availability on agents | Built-in (Azure CLI) | Built-in on hosted agents |
 
 ---
@@ -508,7 +542,7 @@ For wikis with thousands of pages or large attachments, `az storage blob upload-
 ## End-to-End Flow
 
 ```
- Developer edits wiki page in Azure DevOps
+ Developer creates / edits / deletes / renames a wiki page
                     │
                     ▼
  Git commit pushed to <project>.wiki repo (wikiMain branch)
@@ -517,22 +551,22 @@ For wikis with thousands of pages or large attachments, `az storage blob upload-
  Pipeline triggered (resource trigger on wiki repo)
                     │
                     ▼
- Agent clones wiki repo (shallow, fetchDepth: 1 or 2)
+ Agent clones wiki repo (shallow, fetchDepth: 2)
                     │
                     ▼
- Filter: keep only *.md, exclude .attachments/, .order, README.md
+ git diff detects which .md files were added, modified, renamed, or deleted
+                    │
+                    ├── Added / Modified .md  ──>  Upload blob (--overwrite)
+                    ├── Renamed .md           ──>  Delete old blob + upload new blob
+                    └── Deleted .md           ──>  Delete blob
                     │
                     ▼
- Upload changed MD files to Blob Storage (markdown-docs container)
-                    │
-                    ▼
- Delete removed blobs (if incremental sync)
+ Blob Storage now mirrors the wiki's .md files exactly
                     │
                     ▼
  Search indexer detects changes via blob change feed (next scheduled run)
-                    │
-                    ▼
- Indexer re-processes changed docs (skillset: split, keyphrase, embed)
+   ├── New/modified blobs  ──>  Re-index document (skillset: split, keyphrase, embed)
+   └── Soft-deleted blobs  ──>  Remove document from search index
                     │
                     ▼
  Updated content available via MCP tools (get_document, semantic_search)
@@ -563,10 +597,12 @@ For wikis with thousands of pages or large attachments, `az storage blob upload-
 - [ ] Identify wiki type (Provisioned or Published) and note the Git repo name
 - [ ] Create Azure DevOps service connection to the Azure subscription
 - [ ] Grant the service principal `Storage Blob Data Contributor` on the storage account
-- [ ] Create the sync pipeline YAML in your main repo
+- [ ] Create the incremental sync pipeline YAML in your main repo
 - [ ] Configure the wiki repo as a pipeline resource with trigger on `wikiMain`
-- [ ] Run a full sync to seed the blob container
-- [ ] Verify the search indexer picks up the uploaded files
-- [ ] Set up the weekly scheduled full sync as a safety net
-- [ ] (Optional) Sync `.attachments/` if images are needed
+- [ ] Run a full sync to seed the blob container with all existing `.md` files
+- [ ] Verify the search indexer picks up the uploaded `.md` files
+- [ ] Test update: edit a wiki page, confirm blob is overwritten and re-indexed
+- [ ] Test delete: remove a wiki page, confirm blob is deleted and removed from index
+- [ ] Test rename: rename a wiki page, confirm old blob deleted + new blob created
+- [ ] Set up the weekly scheduled full sync as a safety net for orphan cleanup
 - [ ] (Optional) Add secret scanning step before upload
